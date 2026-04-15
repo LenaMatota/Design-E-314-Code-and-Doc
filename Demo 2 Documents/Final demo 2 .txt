@@ -1,0 +1,819 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define BUTTON_DEBOUNCE_TIME_MS 150
+#define TEMP_BUFFER_SIZE 5
+#define TRIG_PIN GPIO_PIN_3
+#define TRIG_PORT GPIOC
+#define TEMP_WINDOW_TIME 1000
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+// LED state tracking
+static uint8_t led_d2_state = 1;  // D2 starts ON (continuously)
+uint8_t led_d3_state = 1;  // D3 starts flashing
+static uint8_t led_d4_state = 1;  // D4 starts ON (continuously)
+uint8_t led_d5_state = 1;  // D5 starts flashing
+
+// Flash timing
+uint32_t lastFlashTime = 0;
+uint8_t flashToggle = 0;
+
+// Debounce trackers for each specific button
+uint32_t LastTick_S1_PA0  = 0; // S1
+uint32_t LastTick_S2_PB8  = 0; // S2
+uint32_t LastTick_S3_PA7  = 0; // S3
+uint32_t LastTick_S4_PB6  = 0; // S4
+uint32_t LastTick_S5_PB9  = 0; // S5
+
+// Temperature sensor tracking
+volatile uint32_t pulse_count = 0;
+volatile uint32_t last_capture_time = 0;
+volatile float current_temp = -50.0f;
+volatile uint8_t temp_ready = 0;
+
+// Temperature sensor calibration
+float temp_buffer[TEMP_BUFFER_SIZE] = {0};
+uint8_t temp_index = 0;
+uint8_t buffer_full = 0;
+
+//Variables for the proximity sensor
+volatile uint32_t echo_start = 0;
+volatile uint32_t echo_end = 0;
+volatile uint8_t echo_captured = 0;
+volatile float distance_cm = 0.0f;
+
+// For the UART @Stat Command
+uint8_t rx;
+char uart_cmd[20];
+uint8_t idx = 0;
+
+// For alarm coding
+volatile uint8_t proximity_alarm = 0;
+volatile uint8_t temperature_alarm = 0;
+volatile uint8_t alarm_check_enabled = 0;   // alarms disabled at startup
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+/* USER CODE BEGIN PFP */
+float CalibrateTemperature(float new_temp);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void SendStudent_Number(void)
+{
+    HAL_Delay(350);
+    char uart_buffer[20];
+    const char studentNumber[] = "*24989142#\n";
+    sprintf(uart_buffer, "%s", studentNumber);
+    HAL_UART_Transmit(&huart2, (uint8_t*)studentNumber, sizeof(studentNumber)-1, 500);
+}
+
+void UpdateLEDs(void)
+{
+    uint32_t now = HAL_GetTick();
+    if((now - lastFlashTime) >= 500)
+    {
+        lastFlashTime = now;
+        flashToggle ^= 1;
+    }
+
+    // If alarms enabled, LEDs default OFF
+    if(alarm_check_enabled)
+    {
+        // D2
+        if(proximity_alarm)
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, flashToggle ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        else
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+
+        // D3
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+
+        // D4
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, GPIO_PIN_RESET);
+
+        // D5
+        if(temperature_alarm)
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, flashToggle ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        else
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_RESET);
+    }
+    else
+    {
+        // Normal manual LED control
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, led_d2_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, led_d3_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, led_d4_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, led_d5_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    }
+}
+
+void S1_Button(void)
+{
+    static uint8_t state = 0;
+    static uint32_t press_time = 0;
+
+    uint8_t current = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+    if (current == 1 && state == 0)
+    {
+        // Button just pressed
+        press_time = HAL_GetTick();
+        state = 1;
+    }
+    if (current == 0 && state == 1)
+    {
+        // Button released
+        uint32_t duration = HAL_GetTick() - press_time;
+        if (duration > 100)   // must be held 100ms
+        {
+        	led_d2_state = !led_d2_state;
+        	alarm_check_enabled = 0;
+        }
+        state = 0;
+    }
+}
+
+void S2_Button(void)
+{
+    static uint8_t state = 0;
+    static uint32_t press_time = 0;
+
+    uint8_t current = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
+
+    if (current == 1 && state == 0)
+    {
+        // Button just pressed
+        press_time = HAL_GetTick();
+        state = 1;
+    }
+    if (current == 0 && state == 1)
+    {
+        // Button released
+        uint32_t duration = HAL_GetTick() - press_time;
+        if (duration > 100)   // must be held 100ms
+        {
+        	led_d3_state = !led_d3_state;
+        	alarm_check_enabled = 0;
+        }
+        state = 0;
+    }
+}
+
+void S3_Button(void)
+{
+    static uint8_t state = 0;
+    static uint32_t press_time = 0;
+    uint8_t current = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7);
+    if(current == 1 && state == 0)
+    {
+        press_time = HAL_GetTick();
+        state = 1;
+    }
+    if(current == 0 && state == 1)
+    {
+        if(HAL_GetTick() - press_time > 100)
+        {
+            // Enable alarm system
+            alarm_check_enabled = 1;
+
+            // Turn OFF all LEDs
+            led_d2_state = 0;
+            led_d3_state = 0;
+            led_d4_state = 0;
+            led_d5_state = 0;
+        }
+        state = 0;
+    }
+}
+
+void S4_Button(void)
+{
+    static uint8_t state = 0;
+    static uint32_t press_time = 0;
+
+    uint8_t current = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6);
+
+    if (current == 1 && state == 0)
+    {
+        // Button just pressed
+        press_time = HAL_GetTick();
+        state = 1;
+    }
+    if (current == 0 && state == 1)
+    {
+        // Button released
+        uint32_t duration = HAL_GetTick() - press_time;
+        if (duration > 100)   // must be held 100ms
+        {
+            led_d4_state = !led_d4_state;
+            alarm_check_enabled = 0;
+        }
+        state = 0;
+    }
+}
+
+void S5_Button(void)
+{
+    static uint8_t state = 0;
+    static uint32_t press_time = 0;
+
+    uint8_t current = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+
+    if (current == 1 && state == 0)
+    {
+        // Button just pressed
+        press_time = HAL_GetTick();
+        state = 1;
+    }
+    if (current == 0 && state == 1)
+    {
+        // Button released
+        uint32_t duration = HAL_GetTick() - press_time;
+        if (duration > 100)   // must be held 100ms
+        {
+            led_d5_state = !led_d5_state;
+            alarm_check_enabled = 0;
+        }
+        state = 0;
+    }
+}
+
+void UpdateTemperature(void)
+{
+    static uint32_t last_time = 0;
+    if(HAL_GetTick() - last_time >= TEMP_WINDOW_TIME)
+    {
+        last_time = HAL_GetTick();
+        __disable_irq();
+        uint32_t PC = pulse_count;
+        pulse_count = 0;
+        __enable_irq();
+        if(PC > 10)
+        {
+            float temperature = ((float)PC / 4096.0f * 256.0f) - 50.0f;
+            current_temp = CalibrateTemperature(temperature);
+        }
+
+        temp_ready = 1;
+
+        if(alarm_check_enabled)
+        {
+            if(current_temp > 30.0f)
+                temperature_alarm = 1;
+            else
+                temperature_alarm = 0;
+        }
+        else
+        {
+            temperature_alarm = 0;
+        }
+    }
+}
+
+void Trigger_Ultrasonic(void)
+{
+    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_SET);
+    for(volatile int i=0;i<80;i++);  // ~10µs
+    HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  /* USER CODE BEGIN 2 */
+  SendStudent_Number();
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);    // D2 ON
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4,  GPIO_PIN_SET);   // D3 starts ON
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10,  GPIO_PIN_SET);  // D4 ON
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4,  GPIO_PIN_SET);   // D5 starts ON
+
+  flashToggle = 1;
+  lastFlashTime = HAL_GetTick();
+
+  // Initialising Timers
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
+
+  // The stat command
+  HAL_UART_Receive_IT(&huart2,&rx,1);
+
+  static uint32_t last_ultra = 0;
+
+  // Initialising alarm conditions
+  alarm_check_enabled = 0;
+  proximity_alarm = 0;
+  temperature_alarm = 0;
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	UpdateLEDs();
+	S1_Button();
+	S2_Button();
+	S3_Button();
+	S4_Button();
+	S5_Button();
+	UpdateTemperature();
+
+	if(HAL_GetTick() - last_ultra > 100)
+	{
+	    last_ultra = HAL_GetTick();
+	    Trigger_Ultrasonic();
+	}
+
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 83;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 57600;
+  huart2.Init.WordLength = UART_WORDLENGTH_9B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_EVEN;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3|GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, LD2_Pin|GPIO_PIN_10, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PC3 PC4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA0 PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD2_Pin PA10 */
+  GPIO_InitStruct.Pin = LD2_Pin|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB6 PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_8|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+float CalibrateTemperature(float new_temp)
+{
+    temp_buffer[temp_index++] = new_temp;
+
+    if (temp_index >= TEMP_BUFFER_SIZE)
+    {
+        temp_index = 0;
+        buffer_full = 1;
+    }
+    if (!buffer_full) return new_temp;
+
+    // Copy buffer
+    float temp_copy[5];
+    memcpy(temp_copy, temp_buffer, sizeof(temp_buffer));
+
+    // Sort (simple bubble sort)
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 5; j++)
+            if (temp_copy[i] > temp_copy[j])
+            {
+                float t = temp_copy[i];
+                temp_copy[i] = temp_copy[j];
+                temp_copy[j] = t;
+            }
+
+    // Average middle 3 values
+    return (temp_copy[1] + temp_copy[2] + temp_copy[3]) / 3.0f;
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+	// TEMPERATURE SENSOR (TIM3)
+	// TEMPERATURE SENSOR (TIM3)
+	if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+	{
+	    uint32_t current_time = HAL_GetTick();
+	    // Detect start of new pulse burst
+	    if((current_time - last_capture_time) > 4)
+	    {
+	        // new burst starting
+	        pulse_count = 0;
+	    }
+	    pulse_count++;                     // count pulse
+	    last_capture_time = current_time;  // remember pulse time
+	}
+	// PROXIMITY SENSOR (HC-SR04)
+	if ((htim->Instance == TIM2) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2))
+	{
+	    uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+
+	    if(echo_captured == 0)
+	    {
+	        echo_start = capture;
+	        echo_captured = 1;
+	        __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_FALLING);
+	    }
+	    else
+	    {
+	        echo_end = capture;
+	        echo_captured = 0;
+	        __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
+	        uint32_t diff;
+	        if(echo_end >= echo_start)
+	            diff = echo_end - echo_start;
+	        else
+	            diff = (0xFFFFFFFF - echo_start) + echo_end;
+
+	        float time_us = diff;
+	        distance_cm = time_us * 0.0343f / 2.0f;
+	        proximity_alarm = (alarm_check_enabled && distance_cm < 10.0f);
+	    }
+	}
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART2)
+    {
+    	if(idx < sizeof(uart_cmd)-1)
+    	{
+    	    uart_cmd[idx++] = rx;
+    	}
+        if(rx == '&')
+        {
+            uart_cmd[idx] = '\0';
+            if(strstr(uart_cmd,"@Stat&"))
+            {
+                char msg[400];
+                sprintf(msg,
+                "2026/02/26 22:12:42\n"
+                "Distance: %.1f cm\n"
+                "Temperature: %.1f C\n"
+                "Light: 0000 lux\n"
+                "X accel: 0.00 g\n"
+                "Y accel: 0.00 g\n"
+                "Z accel: 0.00 g\n"
+                "Unsafe driving: 0\n"
+                "Impact detected: 0\n"
+                "Low-Light warning: 0\n"
+                "Proximity warning: %d\n"
+                "High Temperature: %d\n"
+                "GPS lat: 0.00000\n"
+                "GPS long: 0.00000\n",
+                distance_cm, current_temp, proximity_alarm, temperature_alarm);
+                HAL_UART_Transmit(&huart2,(uint8_t*)msg,strlen(msg),100);
+            }
+            idx = 0;
+        }
+        HAL_UART_Receive_IT(&huart2,&rx,1);
+    }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

@@ -1,0 +1,1207 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define BUFFER_SIZE 1200
+#define BUTTON_DEBOUNCE_TIME_MS 50
+#define DISPLAY_INTERVAL 250
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+I2C_HandleTypeDef hi2c1;
+
+RTC_HandleTypeDef hrtc;
+
+TIM_HandleTypeDef htim1;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+uint8_t rx_indx;
+uint8_t rx_data[10];
+uint8_t rx_buffer[100];
+uint8_t transfer_cplt;
+float Voffset =1.75;
+float Gain = 1.47;
+float Actual_Voltage = 0;
+float Actual_Current = 0;
+char TDBuffer[100];
+char PrintBuffer[2000];
+uint8_t convCompleted = 0;
+uint16_t ADC_Buffer[BUFFER_SIZE];
+uint16_t ADC_DummyBuffer[BUFFER_SIZE];
+uint32_t Volt_adcBuffer[BUFFER_SIZE / 2];
+uint32_t Current_adcBuffer[BUFFER_SIZE / 2];
+float Apparent_Power = 0;
+float Effective_Voltage = 0;
+float Effective_Current = 0;
+float max_Actual_Voltage = 0;
+float max_Actual_Current = 0;
+volatile uint8_t flag_adc_processing = 0;
+volatile uint8_t flag_uart_processing = 0;
+volatile uint8_t current_screen = 0;
+uint32_t lastDisplayTime = 0;
+char lineBuffer[100];
+volatile uint8_t previous_main_screen = 0;
+static uint8_t led_state = 0;
+float Phase_Angle = 0;
+float Real_Power = 0;
+float Reactive_Power = 0;
+float Power_factor = 0;
+static uint32_t last_debounce_time = 0;
+float  star_flag=0;
+float  star_flag2=0;
+
+// stack for keeping track of screen
+#define MAX_HISTORY 10
+uint8_t screen_history[MAX_HISTORY];
+int history_index = 0;
+
+void push_screen(uint8_t screen) {
+    if (history_index < MAX_HISTORY) {
+        screen_history[history_index++] = screen;
+    }
+}
+
+uint8_t pop_screen(void) {
+    if (history_index > 0) {
+        return screen_history[--history_index];
+    }
+    return 0; // fallback default screen
+}
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_RTC_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_I2C1_Init(void);
+/* USER CODE BEGIN PFP */
+void SendStudent_Number(void);
+void Process_UART_Command(void);
+void Process_ADC_Data(void);
+void Debug_ADC_Values(float max_voltage, float max_current, int voltage_crossings, int current_crossings);
+void UpdateCurrentScreen(void);
+void middle_button(void);
+void Keys_Detect(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void SendStudent_Number(void) {
+    HAL_Delay(150);
+    char uart_buffer[20];
+    const char studentNumber[] = "*XXXXXXXX#\n";
+    sprintf(uart_buffer, "%s", studentNumber);
+    HAL_UART_Transmit(&huart2, (uint8_t*)studentNumber, strlen(studentNumber), 500);
+}
+
+void Process_UART_Command(void) {
+    if (strcmp((char *)rx_buffer, "*Load#") == 0) {
+        led_state = !led_state;
+        HAL_GPIO_WritePin(D2_LED_GPIO_Port, D2_LED_Pin, led_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    } else if (strcmp((char *)rx_buffer, "*Stat#") == 0) {
+        RTC_TimeTypeDef sTime;
+        RTC_DateTypeDef sDate;
+        HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+        HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+        sprintf(PrintBuffer,
+                "%02d/%02d/%02d %02d:%02d:%02d\n"
+                "Voltage:     %.1fV\n"
+                "Current:    %.0fmA\n"
+                "Phase:     %.3frad\n"
+                "Apparent:    %.0fVA\n"
+                "Real:         %.0fW\n"
+                "Reactive:   %.0fVAR\n"
+                "PowerFact:    %.3f\n"
+                "Energy/d:   0.000Wh\n"
+                "MaxPower:    0.000W\n"
+                "UnitsLeft: 0.000kWh\n",
+                sDate.Year + 2000, sDate.Month, sDate.Date,
+                sTime.Hours, sTime.Minutes, sTime.Seconds,
+                Effective_Voltage, Effective_Current * 1000, Phase_Angle, Apparent_Power,
+                Real_Power, Reactive_Power, Power_factor);
+        HAL_UART_Transmit(&huart2, (uint8_t*)PrintBuffer, strlen(PrintBuffer), HAL_MAX_DELAY);
+    }
+}
+
+void Debug_ADC_Values(float max_voltage, float max_current, int voltage_crossings, int current_crossings) {
+    char debug_buffer[100];
+//    sprintf(debug_buffer, "MaxV: %.3fV, MaxI: %.3fA, VCross: %d, ICross: %d\n",
+//            max_voltage, max_current, voltage_crossings, current_crossings);
+//    HAL_UART_Transmit(&huart2, (uint8_t*)debug_buffer, strlen(debug_buffer), 100);
+}
+
+void Process_ADC_Data(void) {
+    float Voltage_Array[BUFFER_SIZE / 2];
+    float Current_Array[BUFFER_SIZE / 2];
+    float max_voltage = -1000.0f;
+    float max_current = -1000.0f;
+    int max_voltage_index = 0;
+    int max_current_index = 0;
+    float voltage_zero_time = 0.0f;
+    float current_zero_time = 0.0f;
+    const float ZERO_THRESHOLD = 0.03f; // Increased to 0.03V from 0.02V
+    const float CROSSING_THRESHOLD = 0.01f; // Tolerance for zero-crossing detection
+    float voltage_zero_sum = 0.0f;
+    float current_zero_sum = 0.0f;
+    int voltage_zero_count = 0;
+    int current_zero_count = 0;
+
+    memcpy(ADC_DummyBuffer, ADC_Buffer, BUFFER_SIZE * sizeof(uint16_t));
+
+    // Count zero-crossings to detect valid 50 Hz signal
+    int voltage_crossings = 0;
+    int current_crossings = 0;
+
+    for (int i = 0; i < BUFFER_SIZE / 2; i++) {
+        Volt_adcBuffer[i] = ADC_DummyBuffer[2 * i];
+        Current_adcBuffer[i] = ADC_DummyBuffer[2 * i + 1];
+
+        float Voltage = ((float)Volt_adcBuffer[i] * 3.3f) / 4095.0f;
+        float Current = ((float)Current_adcBuffer[i] * 3.3f) / 4095.0f;
+
+        Voltage_Array[i] = ((Voltage - Voffset) / Gain);
+        Current_Array[i] = ((Current - Voffset) / Gain);
+
+        if (Voltage_Array[i] > max_voltage) {
+            max_voltage = Voltage_Array[i];
+            max_voltage_index = i;
+        }
+        if (Current_Array[i] > max_current) {
+            max_current = Current_Array[i];
+            max_current_index = i;
+        }
+
+        float abs_Voltage = fabs(Voltage_Array[i]);
+        float abs_Current = fabs(Current_Array[i]);
+        if (abs_Voltage > max_Actual_Voltage) {
+            max_Actual_Voltage = abs_Voltage;
+        }
+        if (abs_Current > max_Actual_Current) {
+            max_Actual_Current = abs_Current;
+        }
+
+        // Detect zero-crossings with tolerance
+        if (i < BUFFER_SIZE / 2 - 1) {
+            if ((Voltage_Array[i] >= -CROSSING_THRESHOLD && Voltage_Array[i + 1] < -CROSSING_THRESHOLD) ||
+                (Voltage_Array[i] <= CROSSING_THRESHOLD && Voltage_Array[i + 1] > CROSSING_THRESHOLD)) {
+                voltage_crossings++;
+            }
+            if ((Current_Array[i] >= -CROSSING_THRESHOLD && Current_Array[i + 1] < -CROSSING_THRESHOLD) ||
+                (Current_Array[i] <= CROSSING_THRESHOLD && Current_Array[i + 1] > CROSSING_THRESHOLD)) {
+                current_crossings++;
+            }
+        }
+    }
+
+    // Calculate effective values
+    Effective_Voltage =1.08490566f*115.0f * (2.0 * max_Actual_Voltage);
+    Effective_Current = 1.086169442f*7.5 * (2.0 * max_Actual_Current);
+
+    // Debug output to diagnose zero-state issue
+    Debug_ADC_Values(max_Actual_Voltage, max_Actual_Current, voltage_crossings, current_crossings);
+
+    // Apply thresholds for zero-state detection
+    bool is_zero_state = false;
+    // Expect at least 2 zero-crossings for two 50 Hz cycles (1 per cycle)
+    if (Effective_Voltage < 30.0f || max_Actual_Voltage < ZERO_THRESHOLD || voltage_crossings < 2) {
+        Effective_Voltage = 0.0f;
+        is_zero_state = true;
+    }
+    if (Effective_Current < 1.3f || max_Actual_Current < ZERO_THRESHOLD || current_crossings < 2) { // 1300mA = 1.3A
+        Effective_Current = 0.0f;
+        is_zero_state = true;
+    }
+
+    if (is_zero_state) {
+        // Set all derived metrics to zero
+        Apparent_Power = 0.0f;
+        Real_Power = 0.0f;
+        Reactive_Power = 0.0f;
+        Phase_Angle = 0.0f;
+        Power_factor = 0.0f;
+    } else {
+        // Proceed with normal calculations
+        Apparent_Power = Effective_Voltage * Effective_Current;
+
+        for (int i = 0; i < BUFFER_SIZE / 2 - 1; i++) {
+            if (Voltage_Array[i] >= 0 && Voltage_Array[i + 1] < 0) {
+                float y1 = Voltage_Array[i];
+                float y2 = Voltage_Array[i + 1];
+                float x1 = i * 50e-6f;
+                float x2 = (i + 1) * 50e-6f;
+                float zero_time = x1 - y1 * (x2 - x1) / (y2 - y1);
+                voltage_zero_sum += zero_time;
+                voltage_zero_count++;
+            }
+            if (Current_Array[i] >= 0 && Current_Array[i + 1] < 0) {
+                float y1 = Current_Array[i];
+                float y2 = Current_Array[i + 1];
+                float x1 = i * 50e-6f;
+                float x2 = (i + 1) * 50e-6f;
+                float zero_time = x1 - y1 * (x2 - x1) / (y2 - y1);
+                current_zero_sum += zero_time;
+                current_zero_count++;
+            }
+        }
+
+        if (voltage_zero_count > 0 && current_zero_count > 0) {
+            voltage_zero_time = voltage_zero_sum / voltage_zero_count;
+            current_zero_time = current_zero_sum / current_zero_count;
+            float time_diff = current_zero_time - voltage_zero_time;
+            Phase_Angle = time_diff * 2.0f * 3.1415926535f * 50.0f;
+            while (Phase_Angle > 3.1415926535f) Phase_Angle -= 2.0f * 3.1415926535f;
+            while (Phase_Angle < -3.1415926535f) Phase_Angle += 2.0f * 3.1415926535f;
+        } else {
+            Phase_Angle = 0;
+        }
+
+        Real_Power = abs(Effective_Voltage * Effective_Current * cosf(abs(Phase_Angle)));
+        Reactive_Power = Effective_Voltage * Effective_Current * sinf(Phase_Angle);
+        Power_factor = cosf(Phase_Angle);
+    }
+
+    max_Actual_Voltage = 0;
+    max_Actual_Current = 0;
+}
+void UpdateCurrentScreen(void) {
+    switch(current_screen) {
+        case 1:  // Voltage + Current + Phase
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Voltage:    %.1fV", Effective_Voltage);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "Current:   %.0fmA", Effective_Current * 1000);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "Phase:   %.3fRad", Phase_Angle);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 2:  // Real + Reactive + Power Factor
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Real:        %.0fW", Real_Power);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "Reactive:  %.0fVAR", Reactive_Power);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "PowerFact:   %.3f", Power_factor);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 3:  // Clock + MaxPower + Min Units
+            RTC_TimeTypeDef sTime;
+            RTC_DateTypeDef sDate;
+            HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+            HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "%02d:%02d:%02d  %02d/%02d/%02d", sTime.Hours, sTime.Minutes, sTime.Seconds, sDate.Year, sDate.Month, sDate.Date);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "Max power:   %.0fW", Real_Power);
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "Min Units:  000kWh");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 4:  // Enter Menu 1
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Menu(Lv1 1):");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "1: Load On/Off");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "2: manage Units");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 5:  // Load switch Menu
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Load on/off");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "1=ON  2=OFF");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "'*' to confirm");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 6:  // Menu 2
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Menu(Lv1 2):");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "1: Count On/Off");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "2: Add Units");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 7:  // Unit count Menu
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Unit Count on/off");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer, "1=ON  2=OFF");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "'*' to confirm");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 8:  // Unit count Menu
+            ssd1306_Fill(Black);
+            ssd1306_SetCursor(0, 0);
+            sprintf(lineBuffer, "Units to add:");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_SetCursor(0, 9);
+            sprintf(lineBuffer,"0(Note:Awaiting input xxx)");
+            ssd1306_WriteString(lineBuffer, Font_6x8, White);
+            ssd1306_SetCursor(0, 22);
+            sprintf(lineBuffer, "Press '*' to add");
+            ssd1306_WriteString(lineBuffer, Font_7x10, White);
+            ssd1306_UpdateScreen();
+            break;
+
+        case 9:  //LOAD_ON
+        	ssd1306_Fill(Black);
+        	ssd1306_SetCursor(0, 0);
+        	sprintf(lineBuffer, "Load on/off");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 9);
+        	sprintf(lineBuffer, "1=ON# 2=OFF");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 22);
+        	sprintf(lineBuffer, "'*' to confirm");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_UpdateScreen();
+        	break;
+
+        case 10:  //LOAD_OFF
+        	ssd1306_Fill(Black);
+        	ssd1306_SetCursor(0, 0);
+        	sprintf(lineBuffer, "Load on/off");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 9);
+        	sprintf(lineBuffer, "1=ON 2=OFF#");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 22);
+        	sprintf(lineBuffer, "'*' to confirm");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_UpdateScreen();
+        	break;
+
+        case 11://COUNT_ON
+        	ssd1306_Fill(Black);
+        	ssd1306_SetCursor(0, 0);
+        	sprintf(lineBuffer, "Unit Count on/off");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 9);
+        	sprintf(lineBuffer, "1=ON# 2=OFF");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 22);
+        	sprintf(lineBuffer, "'*' to confirm");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_UpdateScreen();
+        	break;
+
+        case 12:// COUNT_OFF
+        	ssd1306_Fill(Black);
+        	ssd1306_SetCursor(0, 0);
+        	sprintf(lineBuffer, "Unit Count on/off");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 9);
+        	sprintf(lineBuffer, "1=ON  2=OFF#");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 22);
+        	sprintf(lineBuffer, "'*' to confirm");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_UpdateScreen();
+        	break;
+
+        case 0:  // Apparent + Energy + Units
+        default:
+        	ssd1306_Fill(Black);
+        	ssd1306_SetCursor(0, 0);
+        	sprintf(lineBuffer, "Apparent:   %.0fVA", Apparent_Power);
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 9);
+        	sprintf(lineBuffer, "Energy/d:  0.000Wh");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_SetCursor(0, 22);
+        	sprintf(lineBuffer, "Units:  000.000kWh");
+        	ssd1306_WriteString(lineBuffer, Font_7x10, White);
+        	ssd1306_UpdateScreen();
+        	break;
+
+    }
+}
+
+void middle_button(void) {
+    static uint8_t prev_button_state = 1;
+    uint32_t current_time = HAL_GetTick();
+    uint8_t current_button_state = HAL_GPIO_ReadPin(Middle_Button_GPIO_Port, Middle_Button_Pin);
+
+    if ((prev_button_state == 1) && (current_button_state == 0) && (current_time - last_debounce_time) > BUTTON_DEBOUNCE_TIME_MS) {
+        led_state = !led_state;
+        HAL_GPIO_WritePin(D2_LED_GPIO_Port, D2_LED_Pin, led_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        last_debounce_time = current_time;
+    }
+    prev_button_state = current_button_state;
+}
+void Keys_Detect(void) {
+    HAL_GPIO_WritePin(R1_GPIO_Port, R1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(R2_GPIO_Port, R2_Pin , GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(R3_GPIO_Port, R3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(R4_GPIO_Port, R4_Pin, GPIO_PIN_RESET);
+
+    if (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin) == GPIO_PIN_SET) {
+
+    	/*1*/
+        if (current_screen == 0 || current_screen == 2 || current_screen == 3) {
+            current_screen = 1;
+        } else if (current_screen == 4) {
+        	push_screen(current_screen);
+        	current_screen = 5;
+        } else if (current_screen == 6) {
+        	push_screen(current_screen);
+            current_screen = 7;
+        }
+        else if (current_screen == 5) {
+        push_screen(current_screen);
+        current_screen = 9;
+        star_flag=1;
+        }
+        else if (current_screen == 7) {
+        	push_screen(current_screen);
+        	current_screen = 11;
+        }
+        else if (current_screen == 9) {
+        	push_screen(current_screen);
+
+              }
+        while (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin) == GPIO_PIN_SET) {
+
+    	/*2*/
+    	if (current_screen == 0 || current_screen == 1 || current_screen == 3) {
+    		current_screen = 2;
+    	}
+    	else if (current_screen == 4) {
+    		push_screen(current_screen);
+    		current_screen = 6;
+    	}
+         else if (current_screen == 6) {
+        	 push_screen(current_screen);
+        	 current_screen = 8;
+        }
+        else if (current_screen == 5) {
+             push_screen(current_screen);
+             current_screen = 10;
+             star_flag2=1;
+             }
+        else if (current_screen == 7) {
+        	push_screen(current_screen);
+        	current_screen = 12;
+        }
+        else if (current_screen==10){
+        	push_screen(current_screen);
+        }
+        while (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin) == GPIO_PIN_SET) {
+
+    	/*3*/
+        current_screen = 3;
+        while (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin));
+    }
+
+    HAL_GPIO_WritePin(R1_GPIO_Port, R1_Pin, GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R2_GPIO_Port, R2_Pin , GPIO_PIN_SET);
+     HAL_GPIO_WritePin(R3_GPIO_Port, R3_Pin, GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R4_GPIO_Port, R4_Pin, GPIO_PIN_RESET);
+    if (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin) == GPIO_PIN_SET) {
+
+    	/*4*/
+        while (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin) == GPIO_PIN_SET) {
+
+    	/*5*/
+        while (HAL_GPIO_ReadPin(GPIOC, C2_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin) == GPIO_PIN_SET) {
+    	/*6*/
+        while (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin));
+    }
+
+    HAL_GPIO_WritePin(R1_GPIO_Port, R1_Pin, GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R2_GPIO_Port, R2_Pin , GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R3_GPIO_Port, R3_Pin, GPIO_PIN_SET);
+     HAL_GPIO_WritePin(R4_GPIO_Port, R4_Pin, GPIO_PIN_RESET);
+    if (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin) == GPIO_PIN_SET) {
+    	/*7*/
+        while (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin) == GPIO_PIN_SET) {
+    	/*8*/
+        while (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin) == GPIO_PIN_SET) {
+    	/*9*/
+        while (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin));
+    }
+
+    HAL_GPIO_WritePin(R1_GPIO_Port, R1_Pin, GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R2_GPIO_Port, R2_Pin , GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R3_GPIO_Port, R3_Pin, GPIO_PIN_RESET);
+     HAL_GPIO_WritePin(R4_GPIO_Port, R4_Pin, GPIO_PIN_SET);
+    if (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin) == GPIO_PIN_SET) {
+    	/* * */
+        if (current_screen == 5 || current_screen == 7 || current_screen == 9 || current_screen == 10 || current_screen == 11 || current_screen == 12) {
+        	current_screen = 0;
+        	if(star_flag==1){
+        	HAL_GPIO_WritePin(D2_LED_GPIO_Port, D2_LED_Pin,GPIO_PIN_SET);
+        	}
+        	else if(star_flag2==1){
+        		HAL_GPIO_WritePin(D2_LED_GPIO_Port, D2_LED_Pin,GPIO_PIN_RESET);
+        	}
+        	star_flag=0;
+        	star_flag2=0;
+        }
+        else if (current_screen == 8) {
+       // Do the adding
+        	push_screen(current_screen);
+        }
+
+        else if (current_screen <= 3) {
+        	push_screen(current_screen);
+            current_screen = 4;
+        }
+        while (HAL_GPIO_ReadPin(C1_GPIO_Port, C1_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin) == GPIO_PIN_SET) {
+
+    	/* 0 */
+        current_screen = 0;
+        while (HAL_GPIO_ReadPin(C2_GPIO_Port, C2_Pin));
+    }
+    if (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin) == GPIO_PIN_SET) {
+
+    	/* # */
+    	if(current_screen >= 4){
+    	  current_screen = pop_screen();
+    	}
+    	  while (HAL_GPIO_ReadPin(C3_GPIO_Port, C3_Pin));
+        }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+    max_Actual_Voltage = 0;
+    max_Actual_Current = 0;
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_RTC_Init();
+  MX_USART2_UART_Init();
+  MX_TIM1_Init();
+  MX_I2C1_Init();
+  /* USER CODE BEGIN 2 */
+    ssd1306_Init();
+    HAL_UART_Receive_IT(&huart2, rx_data, 1);
+    HAL_TIM_Base_Start(&htim1);
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)ADC_Buffer, BUFFER_SIZE);
+    SendStudent_Number();
+    current_screen = 0;
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+    while (1) {
+        if (flag_adc_processing) {
+            flag_adc_processing = 0;
+            Process_ADC_Data();
+        }
+
+        if (flag_uart_processing) {
+            flag_uart_processing = 0;
+            Process_UART_Command();
+        }
+
+        if (HAL_GetTick() - lastDisplayTime > DISPLAY_INTERVAL) {
+            lastDisplayTime = HAL_GetTick();
+            UpdateCurrentScreen();
+        }
+
+        Keys_Detect();
+        middle_button();
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
+  RCC_OscInitStruct.PLL.PLLN = 8;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV32;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.LowPowerAutoPowerOff = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO2;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
+  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
+  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x10B17DB5;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x22;
+  sTime.Minutes = 0x12;
+  sTime.Seconds = 0x42;
+  sTime.SubSeconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_WEDNESDAY;
+  sDate.Month = RTC_MONTH_FEBRUARY;
+  sDate.Date = 0x26;
+  sDate.Year = 0x25;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 3199;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_DISABLE;
+  sSlaveConfig.InputTrigger = TIM_TS_ITR0;
+  if (HAL_TIM_SlaveConfigSynchro(&htim1, &sSlaveConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_ENABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 57600;
+  huart2.Init.WordLength = UART_WORDLENGTH_9B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_EVEN;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, R1_Pin|R2_Pin|R3_Pin|R4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(D2_LED_GPIO_Port, D2_LED_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : C1_Pin C3_Pin C2_Pin */
+  GPIO_InitStruct.Pin = C1_Pin|C3_Pin|C2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Middle_Button_Pin */
+  GPIO_InitStruct.Pin = Middle_Button_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(Middle_Button_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : R1_Pin R2_Pin R3_Pin R4_Pin */
+  GPIO_InitStruct.Pin = R1_Pin|R2_Pin|R3_Pin|R4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : D2_LED_Pin */
+  GPIO_InitStruct.Pin = D2_LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(D2_LED_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        flag_adc_processing = 1;
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t*)ADC_Buffer, BUFFER_SIZE);
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        if (rx_data[0] != '\n') {
+            rx_buffer[rx_indx++] = rx_data[0];
+        } else {
+            rx_buffer[rx_indx] = '\0';
+            rx_indx = 0;
+            transfer_cplt = 1;
+            flag_uart_processing = 1;
+        }
+        HAL_UART_Receive_IT(&huart2, rx_data, 1);
+    }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    // Placeholder for EXTI callbacks if needed
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
