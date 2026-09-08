@@ -1,0 +1,108 @@
+stateDiagram-v2
+    [*] --> Top_Measurements
+
+    Top_Measurements: Menu 1 Measurements
+    Top_DataEntry: Menu 2 Data Entry
+    Top_Diagnostics: Menu 3 Diagnostics
+
+    Top_Measurements --> Top_DataEntry: S5
+    Top_DataEntry --> Top_Diagnostics: S5
+    Top_Diagnostics --> Top_Measurements: S5
+
+    Top_Measurements --> Top_Diagnostics: S1
+    Top_Diagnostics --> Top_DataEntry: S1
+    Top_DataEntry --> Top_Measurements: S1
+
+    Top_Measurements --> M1: S4 enter
+    Top_DataEntry --> D1: S4 enter
+    Top_Diagnostics --> G1: S4 enter
+
+    M1: Measurement Page 1 Dist Temp
+    M2: Measurement Page 2 Accel Light
+    M3: Measurement Page 3 GPS
+    M4: Measurement Page 4 Heading Speed
+    M5: Measurement Page 5 Fuel Efficiency
+
+    M1 --> M2: S5
+    M2 --> M3: S5
+    M3 --> M4: S5
+    M4 --> M5: S5
+    M5 --> M1: S5
+
+    M1 --> Top_Measurements: S2 back
+    M2 --> Top_Measurements: S2 back
+    M3 --> Top_Measurements: S2 back
+    M4 --> Top_Measurements: S2 back
+    M5 --> Top_Measurements: S2 back
+
+    D1: Data Entry Page 1 Fuel Liters
+    D1_Edit: Edit Fuel Liters
+    D2: Data Entry Page 2 Odometer
+    D2_Edit: Edit Odometer
+    D3: Data Entry Page 3 Log Data
+
+    D1 --> D1_Edit: S3 edit
+    D1_Edit --> D1: S3 accept
+    D1_Edit --> D1: S2 cancel
+
+    D2 --> D2_Edit: S3 edit
+    D2_Edit --> D2: S3 accept
+    D2_Edit --> D2: S2 cancel
+
+    D1 --> D2: S5
+    D2 --> D3: S5
+    D3 --> D1: S5
+
+    D1 --> Top_DataEntry: S2 back
+    D2 --> Top_DataEntry: S2 back
+    D3 --> Top_DataEntry: S2 back
+
+    G1: Diagnostic Page 1 SD Card
+    G2: Diagnostic Page 2 MPU6050
+    G3: Diagnostic Page 3 GPS
+    G4: Diagnostic Page 4 Logging
+
+    G1 --> G2: S5
+    G2 --> G3: S5
+    G3 --> G4: S5
+    G4 --> G1: S5
+
+    G1 --> Top_Diagnostics: S2 back
+    G2 --> Top_Diagnostics: S2 back
+    G3 --> Top_Diagnostics: S2 back
+    G4 --> Top_Diagnostics: S2 back
+
+    W1: Warning Unsafe Driving
+    W2: Warning Impact Detected
+    W3: Warning Low Light
+    W4: Warning Proximity
+    W5: Warning High Temperature
+
+    Top_Measurements --> W1: SetWarn 1 or live warning
+    Top_DataEntry --> W1: SetWarn 1 or live warning
+    Top_Diagnostics --> W1: SetWarn 1 or live warning
+    M1 --> W1: warning active
+    D1 --> W1: warning active
+    G1 --> W1: warning active
+
+    Top_Measurements --> W2: SetWarn 2 or live warning
+    Top_DataEntry --> W2: SetWarn 2 or live warning
+    Top_Diagnostics --> W2: SetWarn 2 or live warning
+
+    Top_Measurements --> W3: SetWarn 3 or live warning
+    Top_DataEntry --> W3: SetWarn 3 or live warning
+    Top_Diagnostics --> W3: SetWarn 3 or live warning
+
+    Top_Measurements --> W4: SetWarn 4 or live warning
+    Top_DataEntry --> W4: SetWarn 4 or live warning
+    Top_Diagnostics --> W4: SetWarn 4 or live warning
+
+    Top_Measurements --> W5: SetWarn 5 or live warning
+    Top_DataEntry --> W5: SetWarn 5 or live warning
+    Top_Diagnostics --> W5: SetWarn 5 or live warning
+
+    W1 --> Top_Measurements: S3 acknowledge
+    W2 --> Top_Measurements: S3 acknowledge
+    W3 --> Top_Measurements: S3 acknowledge
+    W4 --> Top_Measurements: S3 acknowledge
+    W5 --> Top_Measurements: S3 acknowledge

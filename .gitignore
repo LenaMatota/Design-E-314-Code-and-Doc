@@ -1,0 +1,16 @@
+# C & STM32 Build Files
+Debug/
+Release/
+*.o
+*.elf
+*.bin
+*.hex
+
+# Inventor & CAD Lock Files
+*.lck
+*.bak
+
+# Large Documents
+*.pdf
+
+.metadata/
